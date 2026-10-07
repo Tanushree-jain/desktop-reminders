@@ -25,14 +25,17 @@ from PySide6.QtCore import QDateTime, QPointF, QRectF, Qt, QTimer, QPoint
 from PySide6.QtGui import (QAction, QColor, QFont, QIcon, QMovie, QPainter, QPainterPath,
                            QPen, QPixmap, QPolygonF)
 from PySide6.QtWidgets import (QApplication, QDateTimeEdit, QDialog, QDialogButtonBox,
-                               QFormLayout, QLineEdit, QMenu, QMessageBox, QSystemTrayIcon,
-                               QWidget)
+                               QFormLayout, QHBoxLayout, QLineEdit, QListWidget,
+                               QListWidgetItem, QMenu, QMessageBox, QPushButton,
+                               QSystemTrayIcon, QVBoxLayout, QWidget)
 
 # ---------------- settings ----------------
 WATER_EVERY_MIN = 45
 BREAK_EVERY_MIN = 60
 MEETING_WARN_MIN = 10
 SHOW_SECONDS = 12
+MEETING_SHOW_SECONDS = 30   # meeting alerts stay longer (they have buttons)
+SNOOZE_MIN = 5              # snooze length for meeting alerts
 # Cat picture: a local path or an http(s) URL to a PNG/GIF/WEBP with TRANSPARENT background.
 # Leave empty to use the built-in drawn cat. (Or just drop cat.gif / cat.png next to this file.)
 CAT_IMAGE = ""
@@ -59,6 +62,20 @@ class Store:
     def add(self, title, when):
         self.con.cursor().execute(
             "INSERT INTO meetings (title, start_time) VALUES (%s, %s)", (title, when))
+
+    def get(self, mid):
+        cur = self.con.cursor(dictionary=True)
+        cur.execute("SELECT * FROM meetings WHERE id=%s", (mid,))
+        return cur.fetchone()
+
+    def update(self, mid, title, when):
+        # notified=0 so an edited meeting reminds you again at its new time
+        self.con.cursor().execute(
+            "UPDATE meetings SET title=%s, start_time=%s, notified=0 WHERE id=%s",
+            (title, when, mid))
+
+    def delete(self, mid):
+        self.con.cursor().execute("DELETE FROM meetings WHERE id=%s", (mid,))
 
     def due(self):
         now = datetime.now()
@@ -178,16 +195,35 @@ FLAGS = Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool
 
 # ---------------- speech bubble ----------------
 class Bubble(QWidget):
-    W, H = 270, 118
+    W = 270
 
     def __init__(self, pet):
         super().__init__(None, FLAGS)
         self.pet, self.text, self.tail_x = pet, "", 135
+        self.H, self.can_snooze = 118, False
         self.setAttribute(Qt.WA_TranslucentBackground)
         self.resize(self.W, self.H)
+        style = ("QPushButton{background:#FFB86B;border:2px solid #4A3426;border-radius:10px;"
+                 "color:#4A3426;font-weight:600;padding:2px 6px}"
+                 "QPushButton:hover{background:#FFD29E}")
+        self.snooze_btn = QPushButton(f"⏰ Snooze {SNOOZE_MIN} min", self)
+        self.ok_btn = QPushButton("Got it", self)
+        for b in (self.snooze_btn, self.ok_btn):
+            b.setCursor(Qt.PointingHandCursor)
+            b.setStyleSheet(style)
+            b.hide()
+        self.snooze_btn.clicked.connect(lambda: self.pet.snooze())
+        self.ok_btn.clicked.connect(lambda: self.pet.dismiss())
 
-    def show_text(self, text):
-        self.text = text
+    def show_text(self, text, can_snooze=False):
+        self.text, self.can_snooze = text, can_snooze
+        self.H = 150 if can_snooze else 118
+        self.resize(self.W, self.H)
+        y = self.H - 58
+        self.snooze_btn.setGeometry(16, y, 150, 28)
+        self.ok_btn.setGeometry(174, y, 80, 28)
+        self.snooze_btn.setVisible(can_snooze)
+        self.ok_btn.setVisible(can_snooze)
         self.follow()
         self.show()
         self.raise_()
@@ -220,7 +256,7 @@ class Bubble(QWidget):
         p.drawPath(path)
         p.setPen(dark)
         p.setFont(QFont("Segoe UI", 11, QFont.DemiBold))
-        p.drawText(QRectF(16, 10, self.W - 32, self.H - 44), Qt.AlignCenter | Qt.TextWordWrap, self.text)
+        p.drawText(QRectF(16, 10, self.W - 32, self.H - 44 - (28 if self.can_snooze else 0)), Qt.AlignCenter | Qt.TextWordWrap, self.text)
 
 
 # ---------------- the tiny draggable cat ----------------
@@ -232,6 +268,7 @@ class Pet(QWidget):
         self.setAttribute(Qt.WA_TranslucentBackground)
         self.resize(self.W, self.H)
         self.t, self.alert, self.queue = 0, False, []
+        self.current, self.on_snooze = None, None
         self.drag, self.moved = None, False
         self.on_click, self.menu = (lambda: None), None
         self.movie = self.pix = None
@@ -266,19 +303,28 @@ class Pet(QWidget):
         self.update()
 
     # reminders
-    def say(self, text):
-        self.queue.append(text)
+    def say(self, text, meeting=None):
+        self.queue.append((text, meeting))
         if not self.alert:
             self._next()
 
     def _next(self):
         if self.alert or not self.queue:
             return
-        self.alert = True
-        self.bubble.show_text(self.queue.pop(0))
-        self.hide_timer.start(SHOW_SECONDS * 1000)
+        text, meeting = self.queue.pop(0)
+        self.alert, self.current = True, meeting
+        self.bubble.show_text(text, can_snooze=meeting is not None)
+        self.hide_timer.start((MEETING_SHOW_SECONDS if meeting else SHOW_SECONDS) * 1000)
+
+    def snooze(self):
+        m = self.current
+        self.dismiss()
+        if m and self.on_snooze:
+            self.on_snooze(m)
+            self.say(f"Okay, I'll remind you again in {SNOOZE_MIN} min 😴")
 
     def dismiss(self):
+        self.current = None
         self.hide_timer.stop()
         self.bubble.hide()
         self.alert = False
@@ -336,13 +382,15 @@ class Pet(QWidget):
 
 # ---------------- add-meeting dialog ----------------
 class AddMeeting(QDialog):
-    def __init__(self):
+    def __init__(self, title="", when=None):
         super().__init__()
-        self.setWindowTitle("Add meeting")
+        self.setWindowTitle("Edit meeting" if title else "Add meeting")
         self.setWindowFlag(Qt.WindowStaysOnTopHint)
         form = QFormLayout(self)
-        self.title = QLineEdit()
-        self.when = QDateTimeEdit(QDateTime.currentDateTime().addSecs(3600))
+        self.title = QLineEdit(title)
+        start = (QDateTime.fromString(when.strftime("%Y-%m-%d %H:%M:%S"), "yyyy-MM-dd HH:mm:ss")
+                 if when else QDateTime.currentDateTime().addSecs(3600))
+        self.when = QDateTimeEdit(start)
         self.when.setCalendarPopup(True)
         self.when.setDisplayFormat("ddd dd MMM yyyy  hh:mm")
         form.addRow("Title", self.title)
@@ -351,6 +399,60 @@ class AddMeeting(QDialog):
         bb.accepted.connect(self.accept)
         bb.rejected.connect(self.reject)
         form.addRow(bb)
+
+
+# ---------------- manage meetings dialog ----------------
+class Manage(QDialog):
+    def __init__(self, store, on_change):
+        super().__init__()
+        self.store, self.on_change = store, on_change
+        self.setWindowTitle("Manage meetings")
+        self.setWindowFlag(Qt.WindowStaysOnTopHint)
+        self.resize(430, 320)
+        lay = QVBoxLayout(self)
+        self.list = QListWidget()
+        self.list.itemDoubleClicked.connect(lambda _: self.edit())
+        lay.addWidget(self.list)
+        row = QHBoxLayout()
+        for label, fn in [("Edit", self.edit), ("Delete", self.delete), ("Close", self.accept)]:
+            b = QPushButton(label)
+            b.clicked.connect(fn)
+            row.addWidget(b)
+        lay.addLayout(row)
+        self.refresh()
+
+    def refresh(self):
+        self.list.clear()
+        rows = self.store.upcoming(100)
+        for r in rows:
+            it = QListWidgetItem(f"{r['start_time']:%a %d %b %H:%M}  -  {r['title']}")
+            it.setData(Qt.UserRole, r)
+            self.list.addItem(it)
+        if not rows:
+            self.list.addItem("No upcoming meetings.")
+
+    def current(self):
+        it = self.list.currentItem()
+        return it.data(Qt.UserRole) if it else None
+
+    def edit(self):
+        r = self.current()
+        if not r:
+            return
+        d = AddMeeting(r["title"], r["start_time"])
+        if d.exec() and d.title.text().strip():
+            self.store.update(r["id"], d.title.text().strip(), d.when.dateTime().toPython())
+            self.refresh()
+            self.on_change()
+
+    def delete(self):
+        r = self.current()
+        if not r:
+            return
+        if QMessageBox.question(self, "Delete meeting", f"Delete \"{r['title']}\"?") == QMessageBox.Yes:
+            self.store.delete(r["id"])
+            self.refresh()
+            self.on_change()
 
 
 # ---------------- app ----------------
@@ -387,12 +489,10 @@ def main():
             pet.say("Saved! I'll remind you 10 min before 📅")
             refresh_tip()
 
-    def show_list():
-        rows = store.upcoming()
-        txt = "\n".join(f"{r['start_time']:%a %d %b %H:%M}  -  {r['title']}" for r in rows)
-        QMessageBox.information(None, "Upcoming meetings", txt or "No upcoming meetings.")
+    def manage():
+        Manage(store, refresh_tip).exec()
 
-    for label, fn in [("Add meeting…", add_meeting), ("Upcoming meetings", show_list),
+    for label, fn in [("Add meeting…", add_meeting), ("Manage meetings…", manage),
                       ("Test reminder", lambda: pet.say("Meow! Stay hydrated 💧")),
                       ("Quit", app.quit)]:
         act = QAction(label, menu)
@@ -423,11 +523,32 @@ def main():
     def brk():
         pet.say(break_msgs[n["b"] % 3]); n["b"] += 1
 
+    def remind(m):
+        secs = (m["start_time"] - datetime.now()).total_seconds()
+        if secs >= 60:
+            when = f"starts in {round(secs / 60)} min!"
+        elif secs > -300:
+            when = "is starting now!"
+        else:
+            when = f"started {abs(round(secs / 60))} min ago"
+        pet.say(f"📅 \"{m['title']}\" {when}", meeting=m if secs > 0 else None)
+
+    def snooze(m):
+        def later():
+            try:
+                fresh = store.get(m["id"])      # may have been edited or deleted meanwhile
+            except mysql.connector.Error:
+                fresh = None
+            if fresh:
+                remind(fresh)
+        QTimer.singleShot(SNOOZE_MIN * 60_000, later)
+
+    pet.on_snooze = snooze
+
     def check_meetings():
         try:
             for m in store.due():
-                mins = max(1, round((m["start_time"] - datetime.now()).total_seconds() / 60))
-                pet.say(f"📅 \"{m['title']}\" starts in {mins} min!")
+                remind(m)
             refresh_tip()
         except mysql.connector.Error:
             pass
